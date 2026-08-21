@@ -56,13 +56,18 @@ export type AskResult =
   | { status: "answered"; answers: unknown }
   | { status: "unavailable"; reason: string; likelyNoModelConfigured?: boolean };
 
-/** Unauthenticated liveness check — safe to call before Setup is complete. */
-export async function checkProxyHealth(baseUrl: string): Promise<boolean> {
+/**
+ * Validates both reachability AND the token — hits the authenticated
+ * /mobile/status/health route rather than the open /mobile/health liveness
+ * check, so a wrong/stale token fails here instead of silently passing
+ * Setup and only surfacing later as a 401 on the Status screen.
+ */
+export async function checkProxyHealth(baseUrl: string, token: string): Promise<boolean> {
   try {
-    const res = await fetch(`${baseUrl.replace(/\/$/, "")}/mobile/health`);
-    if (!res.ok) return false;
-    const body = await res.json();
-    return body?.ok === true;
+    const res = await fetch(`${baseUrl.replace(/\/$/, "")}/mobile/status/health`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    return res.ok;
   } catch {
     return false;
   }

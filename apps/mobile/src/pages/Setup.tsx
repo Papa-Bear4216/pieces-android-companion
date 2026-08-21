@@ -25,7 +25,7 @@ export default function Setup() {
   async function handleTestAndSave() {
     setChecking(true);
     setResult("idle");
-    const reachable = await checkProxyHealth(baseUrl);
+    const reachable = await checkProxyHealth(baseUrl, token);
     setChecking(false);
     if (!reachable) {
       setResult("unreachable");
