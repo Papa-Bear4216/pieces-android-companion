@@ -214,3 +214,86 @@ model, so the same Setup screen works for either by just pointing at a different
 address/token. What did need updating: Setup's copy (now describes both LAN and remote
 modes) and a new `HomeNodeUnreachableError` in `apps/mobile/src/lib/api.ts` so a 503 shows
 as "home PC offline" instead of a generic error.
+
+## Setup screen fixed; Ask root cause narrowed to Pieces cloud account, not code (2026-08-21)
+
+**Two real Setup-screen bugs found and fixed, verified live against a real phone
+(Galaxy S24 Ultra, wireless ADB) and a real proxy/PiecesOS pair:**
+
+1. **Mixed Content blocked every request.** Capacitor's default `capacitor.config.json`
+   serves the WebView over `https://localhost`. Chromium's Mixed Content policy then
+   silently blocks any `http://` fetch the page makes — confirmed via
+   `adb logcat`: `Mixed Content: The page at 'https://localhost/#/setup' was loaded over
+   HTTPS, but requested an insecure resource 'http://<proxy-ip>:8787/mobile/health'.
+   This request has been blocked.` The app's own `network_security_config.xml`
+   (`cleartextTrafficPermitted="true"`) does **not** cover this — that setting only
+   governs Android's OS-level network stack, not the WebView's separate mixed-content
+   rule. Fix: added `"server": {"androidScheme": "http"}` to
+   `apps/mobile/capacitor.config.json` so the app itself loads over `http://localhost`,
+   matching the proxy's scheme. Root-caused by watching live logcat while replaying
+   Test & Save — the "Could not reach proxy" message was misleading; curl against the
+   same URL from the PC succeeded the whole time.
+2. **`checkProxyHealth()` never validated the token.** It called the intentionally
+   unauthenticated `/mobile/health` liveness route, so Setup showed "Connected. Saved."
+   even with a wrong/stale bearer token — confirmed by deliberately corrupting the
+   stored token via `adb shell run-as ... sed -i ...` and observing Setup still report
+   success while the (correctly authenticated) Status screen 401'd. Fix:
+   `checkProxyHealth(baseUrl, token)` now hits the authenticated
+   `/mobile/status/health` route with the entered token, so a bad token now fails at
+   Setup instead of surfacing later as a confusing 401 elsewhere. Re-verified with both
+   a deliberately wrong token (correctly rejected) and the real token (correctly
+   accepted) after the fix.
+
+**Status and Recent confirmed fully working end-to-end** after the Setup fix: Status
+shows `PiecesOS reachable`, real health string, real version (`12.6.1`); Recent loads
+real conversations and assets from this PiecesOS install.
+
+**Ask investigated further — root cause is not `/qgpt/question` being broken, it's zero
+usable models.** Picking up the "worth trying `WS /qgpt/stream`" note from the earlier
+session:
+
+- Pulled `@pieces.app/pieces-os-client@4.1.0` fresh and confirmed `/qgpt/stream` is a
+  real documented WebSocket endpoint (`QGPTApi.js`: "Provides a WebSocket connection
+  that streams inputs to the qGPT model... designed to manage multiple conversations").
+- Live `ws://127.0.0.1:39300/qgpt/stream` test, no `model` field:
+  `{"status":"FAILED","statusCode":500,"errorMessage":"the model was not provided, so
+  we will cancel the stream."}`
+- `QGPTQuestionInput.relevant` (type `RelevantQGPTSeeds`) is a **required** field, not
+  optional as the earlier REST testing assumed. Added `relevant: { iterable: [] }` plus
+  an explicit `model` id — error changed to `"...(failed to fetch model)"`, i.e. it was
+  actually trying to fetch that specific model ID and failing.
+- **`GET /models` on this install returns 99 models, 71 of them `cloud:true` — and
+  `downloaded: false` on every single one.** This is the real root cause, confirmed by
+  a full scan, not inferred: there is no model backing generation of any kind right now,
+  cloud or local. This matches (and now proves) the "most likely cause: no LLM
+  model/runtime configured" hypothesis from the 2026-08-01 session, which had only
+  ruled out a *specific* model ID being the problem, not the underlying downloaded
+  state of the whole model list.
+- Tried the documented fix path: `POST /model/{id}/download` then `POST
+  /model/{id}/load` against `Claude 4.5 Sonnet Chat Model`
+  (`ed05b98e-3c72-49cb-8e2a-de97653c1a0f`, current ID — the old doc's
+  `a737e3fb-3673-4872-90c1-c8ad70c88099` no longer exists in this install's model list,
+  model IDs are not stable across time/updates). Both calls returned 200, but
+  `GET /model/{id}` still shows `downloaded: false` afterward — for a `cloud:true`
+  model, the download/load lifecycle either means something different than it does for
+  local models, or requires a prerequisite this install doesn't have.
+- Retried `/qgpt/stream` with that model id anyway: error changed again, to a bare
+  `"InternalServerError"` — no longer "model not found," now a genuine server-side
+  failure during generation.
+- `GET /user` shows a real signed-in account (`michael711hebert@gmail.com`, account
+  created ~1 month ago) but its `allocation.urls` block shows **two of three cloud
+  endpoints in a `FAILED` state** (`id` and `vanity` allocations both `FAILED`; only
+  `base` is `RUNNING`). This is the most likely actual root cause: partial/broken
+  provisioning on the Pieces cloud account side, not a request-shape or client bug.
+
+**Conclusion: this is not a code problem and should not be worked around in this repo.**
+The mobile app, proxy, and `PiecesClient.ask()` already do the right thing — they
+surface a typed `"unavailable"` result with a clear reason instead of crashing or
+hanging, and that behavior is correct regardless of whether any given PiecesOS install
+has a working model. Fixing Ask for real requires action on the Pieces account/cloud
+side (Pieces Desktop → account/cloud sync status, or Pieces support, re: the `FAILED`
+allocation URLs) — not a proxy, gateway, or mobile app change. Do not build a
+workaround (e.g. shelling out to a third-party CLI/LLM) into this repo to paper over an
+account provisioning issue on one install; that would trade a clear, honest
+"unavailable" error for a maintenance burden every other user of this public repo would
+inherit for a problem specific to one Pieces account.
