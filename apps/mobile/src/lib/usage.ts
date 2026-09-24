@@ -7,6 +7,7 @@ import { Preferences } from "@capacitor/preferences";
 
 const QUEUE_KEY = "pieces-android:usageQueue";
 const MAX_QUEUE_SIZE = 500; // backstop against unbounded growth if flush stays broken for a long time
+let pendingMutation: Promise<void> = Promise.resolve();
 
 export type UsageEvent =
   | { type: "ask"; screen: "ask"; query: string; result: "answered" | "unavailable" | "error"; timestamp: string }
@@ -14,7 +15,9 @@ export type UsageEvent =
   | { type: "screen_view"; screen: "setup" | "status" | "recent" | "ask"; timestamp: string }
   | { type: "setup_saved"; screen: "setup"; mode: "lan" | "remote"; timestamp: string };
 
-async function readQueue(): Promise<UsageEvent[]> {
+export type QueuedUsageEvent = UsageEvent & { _queueId?: string };
+
+async function readQueue(): Promise<QueuedUsageEvent[]> {
   const { value } = await Preferences.get({ key: QUEUE_KEY });
   if (!value) return [];
   try {
@@ -24,25 +27,44 @@ async function readQueue(): Promise<UsageEvent[]> {
   }
 }
 
-async function writeQueue(events: UsageEvent[]): Promise<void> {
+async function writeQueue(events: QueuedUsageEvent[]): Promise<void> {
   await Preferences.set({ key: QUEUE_KEY, value: JSON.stringify(events) });
 }
 
-export async function recordEvent(event: UsageEvent): Promise<void> {
-  const queue = await readQueue();
-  queue.push(event);
-  if (queue.length > MAX_QUEUE_SIZE) queue.splice(0, queue.length - MAX_QUEUE_SIZE);
-  await writeQueue(queue);
+function mutateQueue(operation: () => Promise<void>): Promise<void> {
+  const mutation = pendingMutation.then(operation);
+  pendingMutation = mutation.catch(() => {});
+  return mutation;
 }
 
-export async function peekQueue(): Promise<UsageEvent[]> {
-  return readQueue();
+export function recordEvent(event: UsageEvent): Promise<void> {
+  return mutateQueue(async () => {
+    const queue = await readQueue();
+    queue.push({ ...event, _queueId: crypto.randomUUID() });
+    if (queue.length > MAX_QUEUE_SIZE) queue.splice(0, queue.length - MAX_QUEUE_SIZE);
+    await writeQueue(queue);
+  });
 }
 
-/** Removes exactly the given events from the front of the queue — only call after a confirmed 2xx report. */
-export async function clearSentEvents(sentCount: number): Promise<void> {
-  const queue = await readQueue();
-  await writeQueue(queue.slice(sentCount));
+export function peekQueue(): Promise<QueuedUsageEvent[]> {
+  let snapshot: QueuedUsageEvent[] = [];
+  return mutateQueue(async () => {
+    const queue = await readQueue();
+    if (queue.some((event) => !event._queueId)) {
+      for (const event of queue) event._queueId ||= crypto.randomUUID();
+      await writeQueue(queue);
+    }
+    snapshot = queue;
+  }).then(() => snapshot);
+}
+
+/** Removes only acknowledged events — only call after a confirmed 2xx report. */
+export function clearSentEvents(sentEvents: QueuedUsageEvent[]): Promise<void> {
+  const sentIds = new Set(sentEvents.map((event) => event._queueId));
+  return mutateQueue(async () => {
+    const queue = await readQueue();
+    await writeQueue(queue.filter((event) => !event._queueId || !sentIds.has(event._queueId)));
+  });
 }
 
 export function classifyMode(baseUrl: string): "lan" | "remote" {
