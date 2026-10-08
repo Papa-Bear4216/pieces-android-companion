@@ -16,17 +16,32 @@ export class SeedQueue {
   private readonly queuePath: string;
   private readonly piecesBaseUrl: string;
   private draining = false;
+  private fileOperations: Promise<void> = Promise.resolve();
 
   constructor(queuePath: string, piecesBaseUrl: string) {
     this.queuePath = queuePath;
     this.piecesBaseUrl = piecesBaseUrl;
   }
 
+  private async withFileLock<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.fileOperations;
+    let release!: () => void;
+    this.fileOperations = new Promise<void>((resolve) => { release = resolve; });
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
+  }
+
   /** Append one failed seed attempt to the durable queue. */
   async enqueue(bodyText: string, title: string): Promise<void> {
-    await mkdir(dirname(this.queuePath), { recursive: true });
-    const entry: PendingSeed = { bodyText, title, queuedAt: new Date().toISOString(), attempts: 0 };
-    await appendFile(this.queuePath, JSON.stringify(entry) + "\n", "utf-8");
+    await this.withFileLock(async () => {
+      await mkdir(dirname(this.queuePath), { recursive: true });
+      const entry: PendingSeed = { bodyText, title, queuedAt: new Date().toISOString(), attempts: 0 };
+      await appendFile(this.queuePath, JSON.stringify(entry) + "\n", "utf-8");
+    });
   }
 
   private async readAll(): Promise<PendingSeed[]> {
@@ -60,7 +75,7 @@ export class SeedQueue {
     if (this.draining) return { succeeded: 0, remaining: 0, dropped: 0 };
     this.draining = true;
     try {
-      const entries = await this.readAll();
+      const entries = await this.withFileLock(() => this.readAll());
       if (entries.length === 0) return { succeeded: 0, remaining: 0, dropped: 0 };
 
       const stillPending: PendingSeed[] = [];
@@ -84,8 +99,13 @@ export class SeedQueue {
         }
       }
 
-      await this.writeAll(stillPending);
-      return { succeeded, remaining: stillPending.length, dropped };
+      const remaining = await this.withFileLock(async () => {
+        const current = await this.readAll();
+        const pending = [...stillPending, ...current.slice(entries.length)];
+        await this.writeAll(pending);
+        return pending.length;
+      });
+      return { succeeded, remaining, dropped };
     } finally {
       this.draining = false;
     }
