@@ -10,7 +10,7 @@
   "dependencies": {
     "@pieces-android/allowlist": "file:../../packages/allowlist",
     "@pieces-android/pieces-api": "file:../../packages/pieces-api",
-    "mem0ai": "^3.1.2"
+    "mem0ai": "^3.1.6"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
